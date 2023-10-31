@@ -10,7 +10,7 @@ discount: 0.99
 # train settings
 num_seed_frames: 4000
 # eval
-eval_every_frames: 10000
+eval_every_frames: 20000
 num_eval_episodes: 10
 # snapshot
 save_snapshot: false
@@ -21,8 +21,8 @@ nstep: 3
 batch_size: 256
 # misc
 seed: 1
-device: cuda
-save_video: true
+device: cuda:0
+save_video: false
 save_train_video: false
 use_tb: true
 # experiment
@@ -30,9 +30,11 @@ experiment: exp
 # agent
 lr: 1e-4
 feature_dim: 50
+alpha: 0.5
+beta: 0.5
 
 agent:
-  _target_: drqv2.DrQV2Agent
+  _target_: drqv2_v7.DrQV2Agent
   obs_shape: ??? # to be specified later
   action_shape: ??? # to be specified later
   device: ${device}
@@ -45,6 +47,8 @@ agent:
   feature_dim: ${feature_dim}
   stddev_schedule: ${stddev_schedule}
   stddev_clip: 0.3
+  alpha: ${alpha}
+  beta: ${beta}
 
 hydra:
   run:
