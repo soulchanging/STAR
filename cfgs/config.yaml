@@ -30,11 +30,13 @@ experiment: exp
 # agent
 lr: 1e-4
 feature_dim: 50
-alpha: 0.5
-beta: 0.5
+beta1: 0.5
+beta2: 0.5
+beta3: 1
+use_curl: true
 
 agent:
-  _target_: drqv2_v7.DrQV2Agent
+  _target_: star.DrQV2Agent
   obs_shape: ??? # to be specified later
   action_shape: ??? # to be specified later
   device: ${device}
@@ -47,8 +49,10 @@ agent:
   feature_dim: ${feature_dim}
   stddev_schedule: ${stddev_schedule}
   stddev_clip: 0.3
-  alpha: ${alpha}
-  beta: ${beta}
+  beta1: ${beta1}
+  beta2: ${beta2}
+  beta3: ${beta3}
+  use_curl: ${use_curl}
 
 hydra:
   run:

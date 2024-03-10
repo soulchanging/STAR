@@ -1,7 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
+
 import hydra
 import numpy as np
 import torch
@@ -10,8 +7,6 @@ import torch.nn.functional as F
 import copy
 import utils
 
-# only change critic loss based on drqv2
-# change pi(s) to p(s,zs);Q(s,a) to Q(s,a,zs,zsa)
 def AvgL1Norm(x, eps=1e-8):
     return x/x.abs().mean(-1,keepdim=True).clamp(min=eps)
 
@@ -56,7 +51,7 @@ class Encoder(nn.Module):
 
         assert len(obs_shape) == 3
         self.out_dim = 32 * 35 * 35
-        self.repr_dim = 256
+        self.repr_dim = 128
         
 
         self.convnet = nn.Sequential(nn.Conv2d(obs_shape[0], 32, 3, stride=2),
@@ -89,10 +84,25 @@ class SucEncoder(nn.Module):
         self.zsa2 = nn.Linear(hdim, hdim)
         self.zsa3 = nn.Linear(hdim, repr_dim)
 
-        self.r1 = nn.Linear(repr_dim , hdim)
+        self.r1 = nn.Linear(repr_dim+ action_dim , hdim)
         self.r2 = nn.Linear(hdim, hdim)
         self.r3 = nn.Linear(hdim, 1)
 
+        self.W = nn.Parameter(torch.rand(repr_dim, repr_dim))
+
+    def compute_logits(self, z_a, z_pos):
+        """
+        Uses logits trick for CURL:
+        - compute (B,B) matrix z_a (W z_pos.T)
+        - positives are all diagonal elements
+        - negatives are all other elements
+        - to compute loss use multiclass cross entropy with identity matrix for labels
+        """
+        Wz = torch.matmul(self.W, z_pos.T)  # (z_dim,B)
+        logits = torch.matmul(z_a, Wz)  # (B,B)
+        logits = logits - torch.max(logits, 1)[0][:, None]
+        return logits
+    
 
     def zsa(self, obs, action):
         zsa = self.activ(self.zsa1(torch.cat([obs, action], 1)))
@@ -100,8 +110,8 @@ class SucEncoder(nn.Module):
         zsa = self.zsa3(zsa)
         return zsa
     
-    def r(self,zsa):
-        r = self.activ(self.r1(zsa))
+    def r(self,obs,action):
+        r = self.activ(self.r1(torch.cat([obs, action], 1)))
         r = self.activ(self.r2(r))
         r = self.r3(r)
         return r
@@ -136,7 +146,7 @@ class Critic(nn.Module):
         
         self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
                                    nn.LayerNorm(feature_dim), nn.Tanh())
-        # 256 ? can be modified
+        
         self.ln = nn.LayerNorm(256)
         self.Q01 = nn.Linear(feature_dim + action_shape[0], 256)
         self.Q1 = nn.Sequential(
@@ -155,13 +165,12 @@ class Critic(nn.Module):
     def forward(self, obs, action,zsa):
         h = self.trunk(obs)
         h_action = torch.cat([h, action],1)
-        # embeddings = torch.cat([zsa,zs],1)
-        
-        h_action1 = self.ln(self.Q01(h_action))
+
+        h_action1 = self.Q01(h_action)
         h_action_z1 = torch.cat([h_action1,zsa],1)
         q1 = self.Q1(h_action_z1)
 
-        h_action2 = self.ln(self.Q02(h_action))
+        h_action2 = self.Q02(h_action)
         h_action_z2 = torch.cat([h_action2,zsa],1)
         q2 = self.Q2(h_action_z2)
 
@@ -171,7 +180,7 @@ class Critic(nn.Module):
 class DrQV2Agent:
     def __init__(self, obs_shape, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, num_expl_steps,
-                 update_every_steps, stddev_schedule, stddev_clip, use_tb,alpha):
+                 update_every_steps, stddev_schedule, stddev_clip, use_tb,beta1,beta2,beta3,use_curl):
         self.device = device
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
@@ -179,7 +188,10 @@ class DrQV2Agent:
         self.num_expl_steps = num_expl_steps
         self.stddev_schedule = stddev_schedule
         self.stddev_clip = stddev_clip
-        self.alpha = alpha
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.beta3 = beta3
+        self.use_curl = use_curl
         # models
         self.encoder = Encoder(obs_shape).to(device)
         self.sucencoder = SucEncoder(self.encoder.repr_dim,action_shape[0]).to(device)
@@ -199,7 +211,7 @@ class DrQV2Agent:
         self.sucencoder_opt = torch.optim.Adam(self.sucencoder.parameters(), lr=lr)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
-
+        self.cross_entropy_loss = nn.CrossEntropyLoss()
         # data augmentation
         self.aug = RandomShiftsAug(pad=4)
 
@@ -231,7 +243,7 @@ class DrQV2Agent:
 
         with torch.no_grad():
             stddev = utils.schedule(self.stddev_schedule, step)
-            # fixed_target_zs = self.fixed_sucencoder_target.zs(next_obs)
+            
             dist = self.actor(next_obs, stddev)
             next_action = dist.sample(clip=self.stddev_clip)
             
@@ -243,61 +255,31 @@ class DrQV2Agent:
             target_V = torch.min(target_Q1, target_Q2)
             target_Q = reward + (discount * target_V)
 
-            # fixed_zs = self.fixed_sucencoder.zs(obs)
             fixed_zsa = self.fixed_sucencoder.zsa(obs,action)
 
         Q1, Q2 = self.critic(obs, action,fixed_zsa)
         critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
 
 
-        
-        with torch.no_grad():
-            stddev = utils.schedule(self.stddev_schedule, step)
-            # fixed_target_zs = self.fixed_sucencoder_target.zs(next_obs)
-            dist = self.actor(obs.detach(), stddev)
-            policy_action = dist.sample(clip=self.stddev_clip)
-            
-        pred_zs = self.sucencoder.zsa(obs,action)
-        policy_zsa = self.sucencoder.zsa(obs,policy_action)
-        # and reward information=
-
-        zsa_loss = F.mse_loss(pred_zs,next_obs) +0.6* F.mse_loss(pred_zs.detach(),policy_zsa)
-      
-        r = self.sucencoder.r(pred_zs)
-        # r = self.sucencoder.r(obs,action)
-        r_loss =  F.mse_loss(r,reward)
-
-        repr_loss = zsa_loss + 2*r_loss   
-
-        critic_loss = critic_loss + self.alpha*repr_loss
-
         if self.use_tb:
             metrics['critic_target_q'] = target_Q.mean().item()
             metrics['critic_q1'] = Q1.mean().item()
             metrics['critic_q2'] = Q2.mean().item()
             metrics['critic_loss'] = critic_loss.item()
-            metrics['zsa_loss'] = zsa_loss.item()
-            metrics['r_loss'] = r_loss.item()
-            metrics['repr_loss'] = repr_loss.item()
+
         
         # optimize encoder and critic
-
-
         self.encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
-        self.sucencoder_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_opt.step()
         self.encoder_opt.step()
-        self.sucencoder_opt.step()
-    
 
         return metrics
 
     def update_actor(self, obs, step):
         metrics = dict()
-        # with torch.no_grad():
-        #     zs = self.fixed_sucencoder.zs(obs)
+
         stddev = utils.schedule(self.stddev_schedule, step)
         dist = self.actor(obs, stddev)
         action = dist.sample(clip=self.stddev_clip)
@@ -320,36 +302,43 @@ class DrQV2Agent:
 
         return metrics
 
-    # def update_representation(self,obs,action,next_obs,reward,step):
-    #     metrics = dict()
-    #     r = self.sucencoder.r(obs,action)
-    #     obs = obs.detach()
-    #     with torch.no_grad():
-    #         stddev = utils.schedule(self.stddev_schedule, step)
-    #         # fixed_target_zs = self.fixed_sucencoder_target.zs(next_obs)
-    #         dist = self.actor(obs, stddev)
-    #         policy_action = dist.sample(clip=self.stddev_clip)
+    def update_representation(self,obs,obs_pos,action,next_obs,reward,step):
+        metrics = dict()
+        # 1. CURL loss
+        if self.use_curl:
+            logits = self.sucencoder.compute_logits(obs,obs_pos)
+            labels = torch.arange(logits.shape[0]).long().to(self.device)
+            curl_loss = self.cross_entropy_loss(logits, labels)
+        else:
+            curl_loss = torch.tensor(0.)
+
+        # 2. zsa loss
+        with torch.no_grad():
+            stddev = utils.schedule(self.stddev_schedule, step)
+            dist = self.actor(obs, stddev)
+            policy_action = dist.sample(clip=self.stddev_clip)
             
-    #     pred_zs = self.sucencoder.zsa(obs,action)
-    #     policy_zsa = self.sucencoder.zsa(obs,policy_action)
-    #     # and reward information
+        pred_zs = self.sucencoder.zsa(obs,action)
+        policy_zsa = self.sucencoder.zsa(obs,policy_action)
+        
+        zsa_loss = F.mse_loss(pred_zs,next_obs) + self.beta1*F.mse_loss(pred_zs.detach(),policy_zsa)
+        
+        # 3. reward prediction loss
+        r = self.sucencoder.r(obs,action)
+        r_loss =  F.mse_loss(r,reward)
 
-    #     zsa_loss = F.mse_loss(pred_zs,next_obs) + F.mse_loss(pred_zs.detach(),policy_zsa)
-    #     # r = self.sucencoder.r(pred_zs)
-    #     r_loss =  F.mse_loss(r,reward)
+        repr_loss = zsa_loss + self.beta2*r_loss + self.beta3*curl_loss
 
-    #     repr_loss = zsa_loss + self.alpha*r_loss
-
-    #     self.encoder_opt.zero_grad()
-    #     self.sucencoder_opt.zero_grad()
-    #     repr_loss.backward()
-    #     self.encoder_opt.step()
-    #     self.sucencoder_opt.step()
-    #     if self.use_tb:
-    #         metrics['zsa_loss'] = zsa_loss.item()
-    #         metrics['r_loss'] = r_loss.item()
-    #         metrics['repr_loss'] = repr_loss.item()
-    #     return metrics
+        self.encoder_opt.zero_grad()
+        self.sucencoder_opt.zero_grad()
+        repr_loss.backward()
+        self.encoder_opt.step()
+        self.sucencoder_opt.step()
+        if self.use_tb:
+            metrics['zsa_loss'] = zsa_loss.item()
+            metrics['r_loss'] = r_loss.item()
+            metrics['repr_loss'] = repr_loss.item()
+        return metrics
 
 
         
@@ -361,23 +350,27 @@ class DrQV2Agent:
             return metrics
 
         batch = next(replay_iter)
-        obs, action, reward, discount, next_obs = utils.to_torch(
+        obs, action, reward, discount, next_obs,\
+            sg_obs, sg_action,sg_reward, sg_next_obs = utils.to_torch(
             batch, self.device)
+    
 
         # augment
         obs_aug = self.aug(obs.float())
         next_obs_aug = self.aug(next_obs.float())
 
-        # original_obs = obs_aug.clone()
-        # original_next_obs = next_obs_aug.clone()
-        # encode
-        obs = self.encoder(obs_aug)
-        with torch.no_grad():
-            next_obs = self.encoder(next_obs_aug)
+        sg_obs_aug = self.aug(sg_obs.float())
+        sg_next_obs_aug = self.aug(sg_next_obs.float())
+
 
         if self.use_tb:
             metrics['batch_reward'] = reward.mean().item()
 
+
+        # encode
+        obs = self.encoder(obs_aug)
+        with torch.no_grad():
+            next_obs = self.encoder(next_obs_aug)
 
         # update critic
         metrics.update(
@@ -386,22 +379,23 @@ class DrQV2Agent:
         # update actor
         metrics.update(self.update_actor(obs.detach(), step))
         # # udpdate encoder
-        # obs = self.encoder(original_obs)
-        # next_obs = self.encoder(original_next_obs)
-        # metrics.update(
-        #     self.update_representation(obs,action,next_obs.detach(),reward,step)
-        # )
+        en_sg_obs = self.encoder(sg_obs_aug)
+        sg_obs_aug_pos = self.aug(sg_obs.float())
+        en_sg_obs_pos = self.encoder(sg_obs_aug_pos)
+        with torch.no_grad():
+            en_sg_next_obs = self.encoder(sg_next_obs_aug)
+
+        metrics.update(
+            self.update_representation(en_sg_obs,en_sg_obs_pos.detach(),sg_action,en_sg_next_obs,sg_reward,step)
+        )
+
+
         # # update critic target
         utils.soft_update_params(self.critic, self.critic_target,
                                  self.critic_target_tau)
-        # if step% 2500 == 0:
-        #     self.alpha = self.alpha*0.99
 
-        if step % 250 == 0:
-            self.fixed_sucencoder_target.load_state_dict(self.fixed_sucencoder.state_dict())
-            self.fixed_sucencoder.load_state_dict(self.sucencoder.state_dict())
-        # utils.soft_update_params(self.fixed_sucencoder, self.fixed_sucencoder_target,
-        #                          self.critic_target_tau)    
-        # utils.soft_update_params(self.sucencoder, self.fixed_sucencoder,
-        #                          self.critic_target_tau)
+        utils.soft_update_params(self.fixed_sucencoder, self.fixed_sucencoder_target,
+                                 self.critic_target_tau)    
+        utils.soft_update_params(self.sucencoder, self.fixed_sucencoder,
+                                 self.critic_target_tau)
         return metrics
