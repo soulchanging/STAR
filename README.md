@@ -9,7 +9,7 @@ and uses it to enhance the input of the 𝑄-functions. The representation learn
 features from the raw images, while the state-action encoder takes these features and the action as input to output state-action embedding. During the training of the value functions, the parameters of the state-action encoder remain static, and the output embedding serves as an additional input for the value function. Our implementation builds on top of [DrQv2](https://github.com/facebookresearch/drqv2).
 
 <p align="center">
-  <img src='fig/overview.png' width="750"/>
+  <img src='overview.png' width="750"/>
 </p>
 
 
